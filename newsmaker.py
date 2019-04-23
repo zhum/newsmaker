@@ -3,9 +3,10 @@ import os
 import re
 import requests
 import copy
-from urllib.request import urlopen, Request
+from urllib.request import urlopen, Request, URLError, HTTPError
 from bs4 import BeautifulSoup
 import urllib
+import ssl
 import difflib
 import smtplib
 from smtplib import SMTPHeloError, SMTPAuthenticationError, SMTPException
@@ -13,6 +14,7 @@ import getpass
 import base64
 import time
 import sys
+from yaml import load, dump
 from datetime import timedelta, datetime
 
 
@@ -272,6 +274,8 @@ def checkPage(url, prev="prev.html", new="prev.html", spec=None, attrs=None):
     if spec == None and attrs != None:
         print('\'tag\' is None, but attrs is not: checking the whole page')
     bs1 = cookSoup(url)
+    if bs1==None : #TODO! fix it!
+        return None,None
     if os.path.isfile(prev):
         bs2 = BeautifulSoup(open(prev, "r").read(), "lxml")
         for tag in bs2.findAll("span", attrs={'class':'newsmaker1'}):
@@ -294,7 +298,9 @@ def checkPage(url, prev="prev.html", new="prev.html", spec=None, attrs=None):
         text, (rem, add) = getDiff(text2, text1)
         newtag = BeautifulSoup(text, "lxml")
         newtag = newtag.contents[0].contents[0].contents[0]
-        searcher(bs1).replaceWith(newtag)
+        srch = searcher(bs1)
+        if srch!=None : #TODO! fix it!!!
+            srch.replaceWith(newtag)
     saveTag(bs1, new, True)
     return rem, add
 
@@ -337,11 +343,26 @@ def cookSoup(url):
     while i<3:
         try:
             req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            html = urlopen(req)
-        except Exception as err:
-            print(err)
+            context = ssl._create_unverified_context()
+            html = urlopen(req, context=context)
+        except TimeoutError:
+            print("code=999 err=Timeout")
+            return None
+        except urllib.error.URLError as err:
+            print("code=999 err=urlerror: "+str(err.reason))
+            return None
+        except urllib.error.HTTPError as err:
+            code = err.code
+            print("code="+str(code)+" err=httperror: "+str(err.reason))
+            if code==404 :
+                return None ##### TODO: fix it!!
+            if code>300 and code<400 : # moved permanently / temporarily
+                url = html.getheader('Location')
+                # TODO: save permanent redirect to config
             i += 1
             continue
+        except Exception as err:
+            print("code=999 err="+str(err))
         code = html.read()
         try:
             code = code.decode(encoding='utf-8')
@@ -405,7 +426,8 @@ class Newsmaker:
         try:
             server = smtplib.SMTP_SSL(self.host, 465)
             server.ehlo(self.addr)
-            server.login(self.addr, self.pswd)
+            if self.pswd!=None:
+                passserver.login(self.addr, self.pswd)
             server.quit()
             return 0
         except SMTPHeloError as e:
@@ -417,9 +439,11 @@ class Newsmaker:
             return 2
         except SMTPException as e:
             print("Authentication failed")
+            print(e)
             return 3
-        except:
+        except Exception as e:
             print('Authentication failed')
+            print(e)
             return 3
 
     def sendNotifications(self, group):
@@ -450,16 +474,19 @@ class Newsmaker:
         try:
             server = smtplib.SMTP_SSL(self.host, 465)
             server.ehlo(self.addr)
-            server.login(self.addr, self.pswd)
+            if self.pswd!=None:
+                server.login(self.addr, self.pswd)
             success = True
         except SMTPHeloError as e:
             print('Server did not reply')
         except SMTPAuthenticationError as e:
             print('Incorrect username/password combination')
         except SMTPException as e:
-            print('Authentication failed')
-        except:
-            print('Authentication failed')
+            print('Authentication failed!')
+            print(e)
+        except Exception as e:
+            print('Authentication failed!!')
+            print(e)
         if success:
             try:
                 server.sendmail(self.addr, group.emails, BODY.encode('utf-8'))
@@ -474,6 +501,12 @@ class Newsmaker:
         open(pswd_file, 'w+').write(encoded_pswd.decode())
 
     def __init__(self, config='configure'):
+
+        try:
+            from yaml import CLoader as Loader, CDumper as Dumper
+        except ImportError:
+            from yaml import Loader, Dumper
+
         dir_objs = os.path.join(config, 'objects')
         dir_grps = os.path.join(config, 'groups')
         grps = []
@@ -489,31 +522,45 @@ class Newsmaker:
             grp = Group(lst[0], lst[1].split('\n'), objs)
             grps.append(grp)
         self.grps = grps
-        mail_info = open(os.path.join(config, 'mail')).read().split('\n')
-        self.addr = mail_info[0]
-        if len(mail_info) > 1:
-            self.host = mail_info[1]
-        else:
-            # Try to use smtp server as smtp.<domain_name>
-            self.host = 'smtp.' + self.addr.split('@')[1]
-        pswd_file = os.path.join(config, 'pswd')
-        if os.path.isfile(pswd_file) and getSize(pswd_file) > 0:
-            pswd_mod = datetime.fromtimestamp(os.path.getmtime(filename=pswd_file))
-            present = datetime.now()
-            delta = timedelta(days=self.store_pass)
-            if present - delta > pswd_mod:
-                # Re-enter password if expired
-                self.enterPass(pswd_file)
-            else:
-                self.pswd = base64.b64decode(open(pswd_file).read()).decode()
-        else:
-            self.enterPass(pswd_file)
+
+        yaml_info = open(os.path.join(config, 'mail.yaml')).read()
+        mail_info = load(yaml_info, Loader=Loader)
+        self.host = mail_info['smtp_host']
+        self.pswd = mail_info.get('password')
+        self.name = mail_info.get('username')
+        self.addr = os.popen("uname -n").read().rstrip()
+
+
+
+
+        # mail_info = open(os.path.join(config, 'mail')).read().split('\n')
+        # self.addr = mail_info[0]
+        # if len(mail_info) > 1:
+        #     self.host = mail_info[1]
+        # else:
+        #     # Try to use smtp server as smtp.<domain_name>
+        #     self.host = 'smtp.' + self.addr.split('@')[1]
+        # pswd_file = os.path.join(config, 'pswd')
+        # if os.path.isfile(pswd_file) and getSize(pswd_file) > 0:
+        #     pswd_mod = datetime.fromtimestamp(os.path.getmtime(filename=pswd_file))
+        #     present = datetime.now()
+        #     delta = timedelta(days=self.store_pass)
+        #     if present - delta > pswd_mod:
+        #         # Re-enter password if expired
+        #         self.enterPass(pswd_file)
+        #     else:
+        #         self.pswd = base64.b64decode(open(pswd_file).read()).decode()
+        # else:
+        #     self.enterPass(pswd_file)
         code = self.checkSMTP()
-        while code == 2 and self.tryNum < 3:
-            self.enterPass(pswd_file)
-            code = self.checkSMTP()
-        if self.tryNum == 3 or code != 0:
+        if code != 0:
             sys.exit(0)
+
+        # while code == 2 and self.tryNum < 3:
+        #     self.enterPass(pswd_file)
+        #     code = self.checkSMTP()
+        # if self.tryNum == 3 or code != 0:
+        #     sys.exit(0)
 
     def __repr__(self):
         return self.grps
